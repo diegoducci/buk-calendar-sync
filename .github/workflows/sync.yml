@@ -5,6 +5,9 @@ on:
     - cron: '0 9 * * *'  # 6:00 AM Chile (UTC-3)
   workflow_dispatch:      # Permite ejecución manual
 
+permissions:
+  contents: write
+
 jobs:
   sync:
     runs-on: ubuntu-latest

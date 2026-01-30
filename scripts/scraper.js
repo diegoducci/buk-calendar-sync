@@ -237,48 +237,80 @@ async function navigateToCalendar(page) {
 async function extractEvents(page) {
   console.log('Extracting calendar events...');
 
+  // Log current URL for debugging
+  console.log('Calendar page URL:', page.url());
+
   // Wait for calendar content to load
-  await page.waitForTimeout(2000);
+  await new Promise(r => setTimeout(r, 3000));
+
+  // Debug: Log page structure
+  const pageInfo = await page.evaluate(() => {
+    return {
+      title: document.title,
+      bodyClasses: document.body.className,
+      mainContent: document.querySelector('main, .main, #main, [role="main"]')?.innerHTML?.substring(0, 500) || 'No main found',
+      allClasses: [...new Set([...document.querySelectorAll('*')].map(el => el.className).filter(c => c))].slice(0, 50)
+    };
+  });
+  console.log('Page title:', pageInfo.title);
+  console.log('Some page classes:', pageInfo.allClasses.slice(0, 20).join(', '));
 
   // Try to extract events from various possible calendar formats
   const events = await page.evaluate(() => {
     const extractedEvents = [];
+    const debug = [];
 
-    // Strategy 1: Look for calendar event elements
-    const eventElements = document.querySelectorAll(
-      '.event, .calendar-event, [class*="event"], [class*="vacation"], [class*="ausencia"], [class*="leave"]'
-    );
-
-    eventElements.forEach(el => {
+    // Strategy 1: Look for FullCalendar events (common calendar library)
+    const fcEvents = document.querySelectorAll('.fc-event, .fc-event-title, [class*="fc-"]');
+    debug.push(`FullCalendar elements: ${fcEvents.length}`);
+    fcEvents.forEach(el => {
       const title = el.textContent?.trim();
-      const dateAttr = el.getAttribute('data-date') || el.getAttribute('data-start');
-      if (title && dateAttr) {
-        extractedEvents.push({
-          title,
-          dateStr: dateAttr
-        });
+      const parent = el.closest('[data-date]') || el.closest('.fc-day');
+      const dateAttr = parent?.getAttribute('data-date') || el.getAttribute('data-date');
+      if (title && title.length < 100) {
+        extractedEvents.push({ title, dateStr: dateAttr, source: 'fullcalendar' });
       }
     });
 
-    // Strategy 2: Look for table-based calendars
+    // Strategy 2: Look for calendar event elements with various class patterns
+    const eventSelectors = [
+      '.event', '.calendar-event', '[class*="event"]',
+      '[class*="vacation"]', '[class*="ausencia"]', '[class*="leave"]',
+      '[class*="licencia"]', '[class*="permiso"]', '[class*="feriado"]',
+      '.fc-content', '.fc-title', '[class*="calendar-item"]'
+    ];
+    const eventElements = document.querySelectorAll(eventSelectors.join(', '));
+    debug.push(`Event elements found: ${eventElements.length}`);
+
+    eventElements.forEach(el => {
+      const title = el.textContent?.trim();
+      const dateAttr = el.getAttribute('data-date') || el.getAttribute('data-start') ||
+                       el.closest('[data-date]')?.getAttribute('data-date');
+      if (title && dateAttr && title.length < 100) {
+        extractedEvents.push({ title, dateStr: dateAttr, source: 'events' });
+      }
+    });
+
+    // Strategy 3: Look for table-based calendars
     const tableRows = document.querySelectorAll('table tr, .table-row');
+    debug.push(`Table rows: ${tableRows.length}`);
     tableRows.forEach(row => {
       const cells = row.querySelectorAll('td, .cell');
       if (cells.length >= 2) {
         const possibleDate = cells[0]?.textContent?.trim();
         const possibleTitle = cells[1]?.textContent?.trim();
 
-        // Check if first cell looks like a date
         if (possibleDate?.match(/\d{1,2}[/-]\d{1,2}[/-]\d{2,4}/)) {
           extractedEvents.push({
             title: possibleTitle || 'Evento',
-            dateStr: possibleDate
+            dateStr: possibleDate,
+            source: 'table'
           });
         }
       }
     });
 
-    // Strategy 3: Look for list-based calendars
+    // Strategy 4: Look for list-based calendars
     const listItems = document.querySelectorAll('li, .list-item');
     listItems.forEach(li => {
       const text = li.textContent?.trim();
@@ -286,18 +318,37 @@ async function extractEvents(page) {
       if (dateMatch) {
         extractedEvents.push({
           title: text.replace(dateMatch[0], '').trim() || 'Evento',
-          dateStr: dateMatch[1]
+          dateStr: dateMatch[1],
+          source: 'list'
         });
       }
     });
 
-    return extractedEvents;
+    // Strategy 5: BUK specific - look for any day cells with content
+    const dayCells = document.querySelectorAll('[class*="day"], [class*="cell"], td[class]');
+    debug.push(`Day cells: ${dayCells.length}`);
+    dayCells.forEach(cell => {
+      const date = cell.getAttribute('data-date') || cell.getAttribute('data-day');
+      const content = cell.querySelector('[class*="event"], [class*="item"], span, div');
+      if (date && content && content.textContent?.trim()) {
+        extractedEvents.push({
+          title: content.textContent.trim(),
+          dateStr: date,
+          source: 'daycell'
+        });
+      }
+    });
+
+    console.log('Debug info:', debug.join('; '));
+    return { events: extractedEvents, debug };
   });
 
-  console.log(`Found ${events.length} raw events`);
+  console.log('Extraction debug:', events.debug.join('; '));
+  console.log(`Found ${events.events.length} raw events`);
 
   // Process and format events
-  const processedEvents = events
+  const rawEvents = events.events;
+  const processedEvents = rawEvents
     .filter(e => e.dateStr && e.title)
     .map(event => {
       const startDate = parseDate(event.dateStr);
@@ -308,7 +359,7 @@ async function extractEvents(page) {
         startDate,
         endDate,
         allDay: true,
-        description: 'Imported from BUK'
+        description: `Imported from BUK (${event.source})`
       };
     })
     .filter(e => !isNaN(e.startDate.getTime()));
