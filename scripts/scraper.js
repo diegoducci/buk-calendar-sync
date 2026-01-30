@@ -15,7 +15,8 @@ if (!BUK_EMAIL || !BUK_PASSWORD) {
  */
 function parseDate(dateStr) {
   const [day, month, year] = dateStr.split(/[/-]/).map(Number);
-  return new Date(year, month - 1, day);
+  const fullYear = year < 100 ? 2000 + year : year;
+  return new Date(fullYear, month - 1, day);
 }
 
 /**
@@ -257,19 +258,6 @@ async function main() {
   } finally {
     await browser.close();
   }
-}
-
-// Helper functions need to be available in the main scope
-function parseDate(dateStr) {
-  const [day, month, year] = dateStr.split(/[/-]/).map(Number);
-  const fullYear = year < 100 ? 2000 + year : year;
-  return new Date(fullYear, month - 1, day);
-}
-
-function addDays(date, days) {
-  const result = new Date(date);
-  result.setDate(result.getDate() + days);
-  return result;
 }
 
 main();
