@@ -151,42 +151,87 @@ async function login(page) {
 async function navigateToCalendar(page) {
   console.log('Navigating to vacation calendar...');
 
-  // Look for calendar/vacaciones links
-  const calendarLinks = [
-    'a[href*="calendar"]',
-    'a[href*="vacaciones"]',
-    'a[href*="ausencias"]',
-    'a[href*="time_off"]',
-    'a[href*="leave"]'
-  ];
+  // Wait for page to be fully loaded after login
+  await new Promise(r => setTimeout(r, 2000));
 
-  for (const selector of calendarLinks) {
-    const link = await page.$(selector);
-    if (link) {
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: 'networkidle0' }),
-        link.click()
-      ]);
-      console.log('Found and clicked calendar link');
-      return;
+  // Log current URL for debugging
+  console.log('Current URL after login:', page.url());
+
+  // Look for calendar/vacaciones links using JavaScript click (more reliable)
+  const calendarKeywords = ['calendar', 'vacaciones', 'ausencias', 'time_off', 'leave', 'licencia', 'permiso'];
+
+  const clicked = await page.evaluate((keywords) => {
+    const links = Array.from(document.querySelectorAll('a'));
+    for (const link of links) {
+      const href = (link.href || '').toLowerCase();
+      const text = (link.textContent || '').toLowerCase();
+
+      for (const keyword of keywords) {
+        if (href.includes(keyword) || text.includes(keyword)) {
+          console.log('Found calendar link:', link.href, link.textContent);
+          link.click();
+          return { found: true, href: link.href, text: link.textContent?.trim() };
+        }
+      }
     }
+
+    // Try finding in sidebar/menu
+    const menuItems = document.querySelectorAll('nav a, .sidebar a, .menu a, [role="menu"] a, [class*="nav"] a');
+    for (const item of menuItems) {
+      const text = (item.textContent || '').toLowerCase();
+      for (const keyword of keywords) {
+        if (text.includes(keyword)) {
+          item.click();
+          return { found: true, href: item.href, text: item.textContent?.trim() };
+        }
+      }
+    }
+
+    return { found: false };
+  }, calendarKeywords);
+
+  if (clicked.found) {
+    console.log(`Found and clicked: ${clicked.text} (${clicked.href})`);
+    try {
+      await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 10000 });
+    } catch (e) {
+      // Navigation might have already completed or not been needed
+      console.log('Navigation wait finished (may have already completed)');
+    }
+    return;
   }
 
-  // If no direct link, try navigating through menu
-  const menuItems = await page.$$('nav a, .sidebar a, .menu a');
-  for (const item of menuItems) {
-    const text = await page.evaluate(el => el.textContent?.toLowerCase(), item);
-    if (text?.includes('calendario') || text?.includes('vacaciones') || text?.includes('ausencias')) {
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: 'networkidle0' }),
-        item.click()
-      ]);
-      console.log('Found calendar through menu');
-      return;
+  // Try direct URL navigation if we know the pattern
+  const baseUrl = page.url().split('/').slice(0, 3).join('/');
+  const calendarUrls = [
+    '/calendar',
+    '/vacaciones',
+    '/ausencias',
+    '/time-off',
+    '/leave',
+    '/mis-vacaciones',
+    '/employee/calendar',
+    '/employee/vacaciones'
+  ];
+
+  for (const path of calendarUrls) {
+    try {
+      console.log(`Trying URL: ${baseUrl}${path}`);
+      const response = await page.goto(`${baseUrl}${path}`, {
+        waitUntil: 'networkidle0',
+        timeout: 5000
+      });
+      if (response && response.status() === 200) {
+        console.log(`Successfully navigated to ${path}`);
+        return;
+      }
+    } catch (e) {
+      // Continue to next URL
     }
   }
 
   console.log('Could not find calendar link, continuing on current page...');
+  console.log('Page URL:', page.url());
 }
 
 async function extractEvents(page) {
