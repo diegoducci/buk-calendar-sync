@@ -1,0 +1,13 @@
+{
+  "name": "buk-calendar-sync",
+  "version": "1.0.0",
+  "description": "Sync BUK calendar to Google Calendar via GitHub Pages",
+  "type": "module",
+  "scripts": {
+    "sync": "node scripts/scraper.js"
+  },
+  "dependencies": {
+    "puppeteer": "^21.0.0",
+    "ical-generator": "^7.0.0"
+  }
+}
