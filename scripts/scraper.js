@@ -727,14 +727,13 @@ async function extractEventsWithInterceptedData(page, interceptedData) {
           const startDate = new Date(event.start);
           let endDate = event.end ? new Date(event.end) : startDate;
 
-          // If end date is invalid or before start, set to start
-          if (isNaN(endDate.getTime()) || endDate < startDate) {
-            endDate = startDate;
+          // If end date is invalid or before start, set to next day
+          if (isNaN(endDate.getTime()) || endDate <= startDate) {
+            endDate = addDays(startDate, 1);
           }
 
-          // API dates are INCLUSIVE, ICS dates are EXCLUSIVE for end
-          // So we need to add 1 day to the end date
-          endDate = addDays(endDate, 1);
+          // API dates are already EXCLUSIVE (same as ICS format)
+          // No need to add extra days
 
           return {
             title: event.title,
