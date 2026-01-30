@@ -248,6 +248,45 @@ async function navigateToCalendar(page) {
   console.log('Page URL:', page.url());
 }
 
+/**
+ * Clean event title by removing day numbers and extra whitespace
+ */
+function cleanTitle(title) {
+  if (!title) return '';
+  // Remove leading numbers (day numbers that get concatenated)
+  // Pattern: one or two digits at the start, possibly followed by more text
+  let cleaned = title.replace(/^\d{1,2}(?=\D)/, '').trim();
+  // Also handle cases where multiple names might be concatenated
+  // This is harder to fix automatically, but at least clean up whitespace
+  cleaned = cleaned.replace(/\s+/g, ' ').trim();
+  return cleaned;
+}
+
+/**
+ * Deduplicate events by title and overlapping dates
+ */
+function deduplicateEvents(events) {
+  const eventMap = new Map();
+
+  for (const event of events) {
+    const key = event.title.toLowerCase();
+    if (eventMap.has(key)) {
+      const existing = eventMap.get(key);
+      // Extend date range if overlapping or adjacent
+      if (event.startDate < existing.startDate) {
+        existing.startDate = event.startDate;
+      }
+      if (event.endDate > existing.endDate) {
+        existing.endDate = event.endDate;
+      }
+    } else {
+      eventMap.set(key, { ...event });
+    }
+  }
+
+  return Array.from(eventMap.values());
+}
+
 async function extractEvents(page) {
   console.log('Extracting calendar events...');
 
@@ -269,107 +308,262 @@ async function extractEvents(page) {
   console.log('Page title:', pageInfo.title);
   console.log('Some page classes:', pageInfo.allClasses.slice(0, 20).join(', '));
 
-  // Try to extract events from various possible calendar formats
+  // Strategy 1: Try to access FullCalendar's JavaScript API directly
+  console.log('Attempting to access FullCalendar API...');
+  const fullCalendarEvents = await page.evaluate(() => {
+    try {
+      // FullCalendar v5+ stores the calendar instance on the element
+      const calendarEl = document.querySelector('.fc, [class*="fullcalendar"], #calendar, [id*="calendar"]');
+      if (!calendarEl) {
+        console.log('No calendar element found');
+        return null;
+      }
+
+      // Try to get FullCalendar instance (v5+)
+      // The calendar object is usually stored in __fullCalendar or _calendar
+      let calendarApi = null;
+
+      // Check for FullCalendar v5+ API
+      if (calendarEl.__fullCalendar) {
+        calendarApi = calendarEl.__fullCalendar;
+      } else if (calendarEl._calendar) {
+        calendarApi = calendarEl._calendar;
+      } else if (window.calendar) {
+        calendarApi = window.calendar;
+      }
+
+      // Try to find it via jQuery if available (FullCalendar v3/v4)
+      if (!calendarApi && window.jQuery) {
+        const $cal = window.jQuery(calendarEl);
+        if ($cal.fullCalendar) {
+          // v3 API
+          const events = $cal.fullCalendar('clientEvents');
+          if (events && events.length > 0) {
+            return events.map(e => ({
+              title: e.title,
+              start: e.start?.format?.() || e.start?.toISOString?.() || e.start,
+              end: e.end?.format?.() || e.end?.toISOString?.() || e.end,
+              allDay: e.allDay
+            }));
+          }
+        }
+      }
+
+      if (calendarApi && typeof calendarApi.getEvents === 'function') {
+        const events = calendarApi.getEvents();
+        return events.map(e => ({
+          title: e.title,
+          start: e.start?.toISOString?.() || e.startStr,
+          end: e.end?.toISOString?.() || e.endStr,
+          allDay: e.allDay
+        }));
+      }
+
+      // Try to find calendar data in global scope
+      if (window.__CALENDAR_EVENTS__) {
+        return window.__CALENDAR_EVENTS__;
+      }
+
+      return null;
+    } catch (err) {
+      console.log('Error accessing FullCalendar API:', err.message);
+      return null;
+    }
+  });
+
+  if (fullCalendarEvents && fullCalendarEvents.length > 0) {
+    console.log(`Found ${fullCalendarEvents.length} events via FullCalendar API`);
+    const processedEvents = fullCalendarEvents
+      .filter(e => e.title)
+      .map(event => {
+        const startDate = event.start ? new Date(event.start) : new Date(NaN);
+        // FullCalendar end dates are exclusive, so use them directly
+        // If no end date, default to next day for all-day events
+        let endDate = event.end ? new Date(event.end) : addDays(startDate, 1);
+
+        return {
+          title: cleanTitle(event.title),
+          startDate,
+          endDate,
+          allDay: event.allDay !== false,
+          description: 'Imported from BUK (FullCalendar API)'
+        };
+      })
+      .filter(e => !isNaN(e.startDate.getTime()));
+
+    console.log(`Processed ${processedEvents.length} valid events from FullCalendar API`);
+    if (processedEvents.length > 0) {
+      return deduplicateEvents(processedEvents);
+    }
+  }
+
+  // Strategy 2: DOM-based extraction (fallback)
+  console.log('Falling back to DOM-based extraction...');
   const events = await page.evaluate(() => {
     const extractedEvents = [];
     const debug = [];
 
-    // Strategy 1: Look for FullCalendar events (common calendar library)
-    const fcEvents = document.querySelectorAll('.fc-event, .fc-event-title, [class*="fc-"]');
-    debug.push(`FullCalendar elements: ${fcEvents.length}`);
+    // Look for FullCalendar event elements
+    // FullCalendar v5 uses fc-event class with data attributes
+    const fcEvents = document.querySelectorAll('.fc-event, .fc-daygrid-event, .fc-timegrid-event');
+    debug.push(`FullCalendar event elements: ${fcEvents.length}`);
+
     fcEvents.forEach(el => {
-      const title = el.textContent?.trim();
-      const parent = el.closest('[data-date]') || el.closest('.fc-day');
-      const dateAttr = parent?.getAttribute('data-date') || el.getAttribute('data-date');
-      if (title && title.length < 100) {
-        extractedEvents.push({ title, dateStr: dateAttr, source: 'fullcalendar' });
+      // Get the event title - it's usually in a child element
+      const titleEl = el.querySelector('.fc-event-title, .fc-title, .fc-event-title-container');
+      let title = titleEl?.textContent?.trim() || el.textContent?.trim();
+
+      // Skip if title looks like just a number (day number)
+      if (!title || /^\d+$/.test(title)) return;
+
+      // Try to get date from various sources
+      // 1. From data attributes on the event itself
+      let startStr = el.getAttribute('data-start') || el.getAttribute('data-date');
+      let endStr = el.getAttribute('data-end');
+
+      // 2. From the parent day cell
+      if (!startStr) {
+        const dayCell = el.closest('.fc-day, .fc-daygrid-day, [data-date]');
+        startStr = dayCell?.getAttribute('data-date');
+      }
+
+      // 3. From the event's time element
+      if (!startStr) {
+        const timeEl = el.querySelector('time[datetime]');
+        startStr = timeEl?.getAttribute('datetime');
+      }
+
+      if (title && title.length < 200) {
+        extractedEvents.push({
+          title,
+          start: startStr,
+          end: endStr,
+          source: 'fc-event'
+        });
       }
     });
 
-    // Strategy 2: Look for calendar event elements with various class patterns
-    const eventSelectors = [
-      '.event', '.calendar-event', '[class*="event"]',
-      '[class*="vacation"]', '[class*="ausencia"]', '[class*="leave"]',
-      '[class*="licencia"]', '[class*="permiso"]', '[class*="feriado"]',
-      '.fc-content', '.fc-title', '[class*="calendar-item"]'
-    ];
-    const eventElements = document.querySelectorAll(eventSelectors.join(', '));
-    debug.push(`Event elements found: ${eventElements.length}`);
+    // Also look for events that span multiple days (they might have different markup)
+    const multiDayEvents = document.querySelectorAll('.fc-event-resizable, [class*="fc-event"][class*="start"], [class*="fc-event"][class*="end"]');
+    debug.push(`Multi-day event elements: ${multiDayEvents.length}`);
 
-    eventElements.forEach(el => {
-      const title = el.textContent?.trim();
-      const dateAttr = el.getAttribute('data-date') || el.getAttribute('data-start') ||
-                       el.closest('[data-date]')?.getAttribute('data-date');
-      if (title && dateAttr && title.length < 100) {
-        extractedEvents.push({ title, dateStr: dateAttr, source: 'events' });
+    multiDayEvents.forEach(el => {
+      const titleEl = el.querySelector('.fc-event-title, .fc-title');
+      const title = titleEl?.textContent?.trim() || el.textContent?.trim();
+
+      if (!title || /^\d+$/.test(title)) return;
+
+      // For multi-day events, we need to find the start and end dates
+      const dayCell = el.closest('.fc-day, .fc-daygrid-day, [data-date]');
+      const startStr = dayCell?.getAttribute('data-date');
+
+      // Try to find the end date by looking at sibling events with same title
+      // or by checking if there's an explicit end marker
+
+      if (title && startStr) {
+        extractedEvents.push({
+          title,
+          start: startStr,
+          source: 'fc-multiday'
+        });
       }
     });
 
-    // Strategy 3: Look for table-based calendars
-    const tableRows = document.querySelectorAll('table tr, .table-row');
-    debug.push(`Table rows: ${tableRows.length}`);
-    tableRows.forEach(row => {
-      const cells = row.querySelectorAll('td, .cell');
-      if (cells.length >= 2) {
-        const possibleDate = cells[0]?.textContent?.trim();
-        const possibleTitle = cells[1]?.textContent?.trim();
+    // BUK specific: Look for vacation/absence indicators in day cells
+    const dayCells = document.querySelectorAll('.fc-day, .fc-daygrid-day, td[data-date]');
+    debug.push(`Day cells: ${dayCells.length}`);
 
-        if (possibleDate?.match(/\d{1,2}[/-]\d{1,2}[/-]\d{2,4}/)) {
+    dayCells.forEach(cell => {
+      const date = cell.getAttribute('data-date');
+      if (!date) return;
+
+      // Look for content that indicates an event
+      const eventIndicators = cell.querySelectorAll(
+        '[class*="event"], [class*="vacation"], [class*="ausencia"], ' +
+        '[class*="leave"], [class*="licencia"], [class*="permiso"], ' +
+        '[class*="item"], .fc-event-title'
+      );
+
+      eventIndicators.forEach(indicator => {
+        const title = indicator.textContent?.trim();
+        // Skip day numbers and empty content
+        if (title && !/^\d+$/.test(title) && title.length > 2 && title.length < 200) {
           extractedEvents.push({
-            title: possibleTitle || 'Evento',
-            dateStr: possibleDate,
+            title,
+            start: date,
+            source: 'daycell-indicator'
+          });
+        }
+      });
+    });
+
+    // Look for table-based vacation lists (common in BUK)
+    const tableRows = document.querySelectorAll('table tbody tr, .table tr');
+    debug.push(`Table rows: ${tableRows.length}`);
+
+    tableRows.forEach(row => {
+      const cells = row.querySelectorAll('td');
+      if (cells.length >= 2) {
+        // Try different cell patterns
+        // Pattern 1: [Name] [Start Date] [End Date] [Type]
+        // Pattern 2: [Date] [Name] [Type]
+
+        let name = null;
+        let startDate = null;
+        let endDate = null;
+
+        for (const cell of cells) {
+          const text = cell.textContent?.trim();
+          if (!text) continue;
+
+          // Check if it looks like a date
+          const dateMatch = text.match(/(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})/);
+          if (dateMatch) {
+            if (!startDate) {
+              startDate = text;
+            } else if (!endDate) {
+              endDate = text;
+            }
+          } else if (text.length > 3 && text.length < 100 && !name) {
+            // Likely a name
+            name = text;
+          }
+        }
+
+        if (name && startDate) {
+          extractedEvents.push({
+            title: name,
+            start: startDate,
+            end: endDate,
             source: 'table'
           });
         }
       }
     });
 
-    // Strategy 4: Look for list-based calendars
-    const listItems = document.querySelectorAll('li, .list-item');
-    listItems.forEach(li => {
-      const text = li.textContent?.trim();
-      const dateMatch = text?.match(/(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})/);
-      if (dateMatch) {
-        extractedEvents.push({
-          title: text.replace(dateMatch[0], '').trim() || 'Evento',
-          dateStr: dateMatch[1],
-          source: 'list'
-        });
-      }
-    });
-
-    // Strategy 5: BUK specific - look for any day cells with content
-    const dayCells = document.querySelectorAll('[class*="day"], [class*="cell"], td[class]');
-    debug.push(`Day cells: ${dayCells.length}`);
-    dayCells.forEach(cell => {
-      const date = cell.getAttribute('data-date') || cell.getAttribute('data-day');
-      const content = cell.querySelector('[class*="event"], [class*="item"], span, div');
-      if (date && content && content.textContent?.trim()) {
-        extractedEvents.push({
-          title: content.textContent.trim(),
-          dateStr: date,
-          source: 'daycell'
-        });
-      }
-    });
-
-    console.log('Debug info:', debug.join('; '));
+    debug.push(`Total raw events: ${extractedEvents.length}`);
     return { events: extractedEvents, debug };
   });
 
   console.log('Extraction debug:', events.debug.join('; '));
-  console.log(`Found ${events.events.length} raw events`);
+  console.log(`Found ${events.events.length} raw events from DOM`);
 
   // Process and format events
   const rawEvents = events.events;
   const processedEvents = rawEvents
-    .filter(e => e.dateStr && e.title)
+    .filter(e => e.start && e.title)
     .map(event => {
-      const startDate = parseDate(event.dateStr);
-      const endDate = addDays(startDate, 1);
+      const startDate = parseDate(event.start);
+      // If we have an explicit end date, use it; otherwise default to next day
+      let endDate = event.end ? parseDate(event.end) : addDays(startDate, 1);
+
+      // If end date is same as start (or invalid), set to next day
+      if (isNaN(endDate.getTime()) || endDate <= startDate) {
+        endDate = addDays(startDate, 1);
+      }
 
       return {
-        title: event.title,
+        title: cleanTitle(event.title),
         startDate,
         endDate,
         allDay: true,
@@ -379,7 +573,9 @@ async function extractEvents(page) {
     .filter(e => !isNaN(e.startDate.getTime()));
 
   console.log(`Processed ${processedEvents.length} valid events`);
-  return processedEvents;
+
+  // Deduplicate and merge events with same title and overlapping/adjacent dates
+  return deduplicateEvents(processedEvents);
 }
 
 async function main() {
@@ -390,12 +586,39 @@ async function main() {
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
 
+  let page;
+  // Store intercepted calendar data
+  const interceptedCalendarData = [];
+
   try {
-    const page = await browser.newPage();
+    page = await browser.newPage();
 
     // Set viewport and user agent
     await page.setViewport({ width: 1280, height: 800 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+
+    // Set up response interception to capture calendar API data
+    page.on('response', async (response) => {
+      const url = response.url().toLowerCase();
+      const contentType = response.headers()['content-type'] || '';
+
+      // Look for calendar-related API endpoints
+      if (
+        (url.includes('calendar') || url.includes('event') ||
+         url.includes('vacacion') || url.includes('ausencia') ||
+         url.includes('leave') || url.includes('time_off') ||
+         url.includes('holiday') || url.includes('feriado')) &&
+        contentType.includes('application/json')
+      ) {
+        try {
+          const json = await response.json();
+          console.log(`Intercepted calendar data from: ${url}`);
+          interceptedCalendarData.push({ url, data: json });
+        } catch (e) {
+          // Not JSON or couldn't parse - ignore
+        }
+      }
+    });
 
     // Login to BUK
     await login(page);
@@ -403,8 +626,11 @@ async function main() {
     // Navigate to calendar section
     await navigateToCalendar(page);
 
-    // Extract events
-    const events = await extractEvents(page);
+    // Wait a bit for any async calendar data to load
+    await new Promise(r => setTimeout(r, 2000));
+
+    // Extract events, passing intercepted data
+    const events = await extractEventsWithInterceptedData(page, interceptedCalendarData);
 
     if (events.length === 0) {
       console.log('No events found. Creating empty calendar...');
@@ -420,10 +646,12 @@ async function main() {
 
     // Try to capture current page state for debugging
     try {
-      const currentUrl = page.url();
-      console.log('Current URL:', currentUrl);
-      const pageTitle = await page.title();
-      console.log('Page title:', pageTitle);
+      if (page) {
+        const currentUrl = page.url();
+        console.log('Current URL:', currentUrl);
+        const pageTitle = await page.title();
+        console.log('Page title:', pageTitle);
+      }
     } catch (e) {
       console.log('Could not get page info');
     }
@@ -436,6 +664,87 @@ async function main() {
   } finally {
     await browser.close();
   }
+}
+
+/**
+ * Extract events using intercepted network data first, then fall back to DOM extraction
+ */
+async function extractEventsWithInterceptedData(page, interceptedData) {
+  // Strategy 0: Try to use intercepted calendar API data first
+  if (interceptedData.length > 0) {
+    console.log(`Processing ${interceptedData.length} intercepted API responses...`);
+
+    const apiEvents = [];
+
+    for (const { url, data } of interceptedData) {
+      // Handle various API response formats
+      let events = [];
+
+      if (Array.isArray(data)) {
+        events = data;
+      } else if (data.events && Array.isArray(data.events)) {
+        events = data.events;
+      } else if (data.data && Array.isArray(data.data)) {
+        events = data.data;
+      } else if (data.results && Array.isArray(data.results)) {
+        events = data.results;
+      }
+
+      for (const event of events) {
+        // Try to extract event data from various possible field names
+        const title = event.title || event.name || event.nombre ||
+                     event.employee_name || event.empleado ||
+                     event.description || event.descripcion;
+
+        const start = event.start || event.start_date || event.fecha_inicio ||
+                     event.startDate || event.begin || event.inicio;
+
+        const end = event.end || event.end_date || event.fecha_fin ||
+                   event.endDate || event.finish || event.fin;
+
+        if (title && start) {
+          apiEvents.push({
+            title: cleanTitle(title),
+            start,
+            end,
+            source: 'api-intercept'
+          });
+        }
+      }
+    }
+
+    if (apiEvents.length > 0) {
+      console.log(`Found ${apiEvents.length} events from intercepted API data`);
+
+      const processedEvents = apiEvents
+        .map(event => {
+          const startDate = new Date(event.start);
+          let endDate = event.end ? new Date(event.end) : addDays(startDate, 1);
+
+          // If end date is invalid or before/equal to start, set to next day
+          if (isNaN(endDate.getTime()) || endDate <= startDate) {
+            endDate = addDays(startDate, 1);
+          }
+
+          return {
+            title: event.title,
+            startDate,
+            endDate,
+            allDay: true,
+            description: `Imported from BUK (${event.source})`
+          };
+        })
+        .filter(e => !isNaN(e.startDate.getTime()));
+
+      if (processedEvents.length > 0) {
+        console.log(`Processed ${processedEvents.length} valid events from API`);
+        return deduplicateEvents(processedEvents);
+      }
+    }
+  }
+
+  // Fall back to DOM-based extraction
+  return extractEvents(page);
 }
 
 main();
