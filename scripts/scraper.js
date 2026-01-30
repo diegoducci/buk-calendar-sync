@@ -11,10 +11,24 @@ if (!BUK_EMAIL || !BUK_PASSWORD) {
 }
 
 /**
- * Parse a date string in DD/MM/YYYY or DD-MM-YYYY format
+ * Parse a date string in various formats:
+ * - ISO format: YYYY-MM-DD (from FullCalendar data-date attributes)
+ * - DD/MM/YYYY or DD-MM-YYYY (from text content)
  */
 function parseDate(dateStr) {
-  const [day, month, year] = dateStr.split(/[/-]/).map(Number);
+  if (!dateStr) return new Date(NaN);
+
+  const parts = dateStr.split(/[/-]/).map(Number);
+
+  // Check if it's ISO format (YYYY-MM-DD) - first part is 4 digits and > 1900
+  if (parts[0] > 1900 && parts.length === 3) {
+    // ISO format: YYYY-MM-DD
+    const [year, month, day] = parts;
+    return new Date(year, month - 1, day);
+  }
+
+  // Otherwise assume DD-MM-YYYY or DD/MM/YYYY
+  const [day, month, year] = parts;
   const fullYear = year < 100 ? 2000 + year : year;
   return new Date(fullYear, month - 1, day);
 }
