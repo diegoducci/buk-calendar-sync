@@ -33,7 +33,7 @@ async function login(page) {
   await page.goto(BUK_URL, { waitUntil: 'networkidle0' });
 
   // Wait for login form
-  await page.waitForSelector('input[type="email"], input[name="email"], #email', { timeout: 10000 });
+  await page.waitForSelector('input[type="email"], input[name="email"], #email, input[placeholder*="mail"]', { timeout: 10000 });
 
   // Try different selectors for email field
   const emailSelector = await page.evaluate(() => {
@@ -48,44 +48,101 @@ async function login(page) {
     throw new Error('Could not find email input field');
   }
 
-  console.log('Entering credentials...');
+  console.log('Entering email...');
   await page.type(emailSelector, BUK_EMAIL);
 
-  // Find and fill password field
-  const passwordSelector = await page.evaluate(() => {
+  // Check if password field is already visible (single-step login)
+  let passwordSelector = await page.evaluate(() => {
     const selectors = ['input[type="password"]', 'input[name="password"]', '#password'];
     for (const sel of selectors) {
-      if (document.querySelector(sel)) return sel;
+      const el = document.querySelector(sel);
+      if (el && el.offsetParent !== null) return sel; // Check if visible
     }
     return null;
   });
 
+  // If no password field, this might be a multi-step login - click continue/next
   if (!passwordSelector) {
-    throw new Error('Could not find password input field');
+    console.log('Password field not visible, trying multi-step login...');
+
+    // Click the continue/next button
+    const clicked = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('button, input[type="submit"], a'));
+      const continueBtn = buttons.find(btn => {
+        const text = btn.textContent?.toLowerCase() || '';
+        return text.includes('continuar') || text.includes('continue') ||
+               text.includes('siguiente') || text.includes('next') ||
+               text.includes('iniciar') || text.includes('entrar') ||
+               btn.getAttribute('type') === 'submit';
+      });
+      if (continueBtn) {
+        continueBtn.click();
+        return true;
+      }
+      return false;
+    });
+
+    if (clicked) {
+      // Wait for password field to appear
+      try {
+        await page.waitForSelector('input[type="password"]', { visible: true, timeout: 10000 });
+        console.log('Password field appeared after clicking continue');
+      } catch (e) {
+        // Maybe navigation happened, wait for it
+        await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 10000 }).catch(() => {});
+        await page.waitForSelector('input[type="password"]', { visible: true, timeout: 10000 });
+      }
+    } else {
+      // Try pressing Enter
+      await page.keyboard.press('Enter');
+      await page.waitForSelector('input[type="password"]', { visible: true, timeout: 10000 });
+    }
+
+    // Get password selector again
+    passwordSelector = await page.evaluate(() => {
+      const selectors = ['input[type="password"]', 'input[name="password"]', '#password'];
+      for (const sel of selectors) {
+        if (document.querySelector(sel)) return sel;
+      }
+      return null;
+    });
   }
 
+  if (!passwordSelector) {
+    // Take a screenshot for debugging
+    await page.screenshot({ path: 'debug-screenshot.png' });
+    throw new Error('Could not find password input field after multi-step attempt');
+  }
+
+  console.log('Entering password...');
   await page.type(passwordSelector, BUK_PASSWORD);
 
   // Find and click submit button
-  const submitButton = await page.evaluate(() => {
+  console.log('Submitting login...');
+
+  // Wait a moment for any JavaScript validation
+  await new Promise(r => setTimeout(r, 500));
+
+  const submitClicked = await page.evaluate(() => {
     const buttons = Array.from(document.querySelectorAll('button[type="submit"], input[type="submit"], button'));
-    const loginButton = buttons.find(btn =>
-      btn.textContent?.toLowerCase().includes('iniciar') ||
-      btn.textContent?.toLowerCase().includes('login') ||
-      btn.textContent?.toLowerCase().includes('entrar') ||
-      btn.getAttribute('type') === 'submit'
-    );
-    return loginButton ? true : false;
+    const loginButton = buttons.find(btn => {
+      const text = btn.textContent?.toLowerCase() || '';
+      return text.includes('iniciar') || text.includes('login') ||
+             text.includes('entrar') || text.includes('acceder') ||
+             btn.getAttribute('type') === 'submit';
+    });
+    if (loginButton) {
+      loginButton.click();
+      return true;
+    }
+    return false;
   });
 
-  if (submitButton) {
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: 'networkidle0' }),
-      page.click('button[type="submit"], input[type="submit"]')
-    ]);
+  if (submitClicked) {
+    await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 30000 });
   } else {
     await page.keyboard.press('Enter');
-    await page.waitForNavigation({ waitUntil: 'networkidle0' });
+    await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 30000 });
   }
 
   console.log('Login successful');
@@ -249,6 +306,17 @@ async function main() {
     console.log('Scraping completed successfully!');
   } catch (error) {
     console.error('Error during scraping:', error.message);
+    console.error('Stack trace:', error.stack);
+
+    // Try to capture current page state for debugging
+    try {
+      const currentUrl = page.url();
+      console.log('Current URL:', currentUrl);
+      const pageTitle = await page.title();
+      console.log('Page title:', pageTitle);
+    } catch (e) {
+      console.log('Could not get page info');
+    }
 
     // Generate empty calendar on error so the workflow doesn't fail completely
     console.log('Generating empty calendar due to error...');
