@@ -263,28 +263,54 @@ function cleanTitle(title) {
 }
 
 /**
- * Deduplicate events by title and overlapping dates
+ * Deduplicate events - only merge if they overlap or are adjacent (within 1 day)
+ * Keep separate events that are not contiguous
  */
 function deduplicateEvents(events) {
-  const eventMap = new Map();
+  // Group events by title
+  const eventsByTitle = new Map();
 
   for (const event of events) {
     const key = event.title.toLowerCase();
-    if (eventMap.has(key)) {
-      const existing = eventMap.get(key);
-      // Extend date range if overlapping or adjacent
-      if (event.startDate < existing.startDate) {
-        existing.startDate = event.startDate;
-      }
-      if (event.endDate > existing.endDate) {
-        existing.endDate = event.endDate;
-      }
-    } else {
-      eventMap.set(key, { ...event });
+    if (!eventsByTitle.has(key)) {
+      eventsByTitle.set(key, []);
     }
+    eventsByTitle.get(key).push({ ...event });
   }
 
-  return Array.from(eventMap.values());
+  const result = [];
+
+  for (const [title, titleEvents] of eventsByTitle) {
+    // Sort events by start date
+    titleEvents.sort((a, b) => a.startDate - b.startDate);
+
+    // Merge overlapping or adjacent events (within 1 day gap)
+    const merged = [];
+    for (const event of titleEvents) {
+      if (merged.length === 0) {
+        merged.push(event);
+        continue;
+      }
+
+      const last = merged[merged.length - 1];
+      const gap = (event.startDate - last.endDate) / (1000 * 60 * 60 * 24); // days
+
+      // Merge if overlapping or adjacent (gap <= 1 day)
+      if (gap <= 1) {
+        // Extend the last event
+        if (event.endDate > last.endDate) {
+          last.endDate = event.endDate;
+        }
+      } else {
+        // Keep as separate event
+        merged.push(event);
+      }
+    }
+
+    result.push(...merged);
+  }
+
+  return result;
 }
 
 async function extractEvents(page) {
@@ -677,6 +703,8 @@ async function extractEventsWithInterceptedData(page, interceptedData) {
     const apiEvents = [];
 
     for (const { url, data } of interceptedData) {
+      console.log(`API URL: ${url}`);
+
       // Handle various API response formats
       let events = [];
 
@@ -689,6 +717,13 @@ async function extractEventsWithInterceptedData(page, interceptedData) {
       } else if (data.results && Array.isArray(data.results)) {
         events = data.results;
       }
+
+      console.log(`Raw events count: ${events.length}`);
+
+      // Log first few raw events for debugging
+      events.slice(0, 5).forEach((e, i) => {
+        console.log(`Raw event ${i}: ${JSON.stringify(e).substring(0, 200)}`);
+      });
 
       for (const event of events) {
         // Try to extract event data from various possible field names
@@ -703,6 +738,7 @@ async function extractEventsWithInterceptedData(page, interceptedData) {
                    event.endDate || event.finish || event.fin;
 
         if (title && start) {
+          console.log(`Event: "${cleanTitle(title)}" | ${start} - ${end || 'no end'}`);
           apiEvents.push({
             title: cleanTitle(title),
             start,
