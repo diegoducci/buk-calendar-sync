@@ -263,51 +263,21 @@ function cleanTitle(title) {
 }
 
 /**
- * Deduplicate events - only merge if they overlap or are adjacent (within 1 day)
- * Keep separate events that are not contiguous
+ * Deduplicate events - remove exact duplicates only (same title, start, end)
+ * Do NOT merge adjacent events - keep them separate as BUK shows them
  */
 function deduplicateEvents(events) {
-  // Group events by title
-  const eventsByTitle = new Map();
-
-  for (const event of events) {
-    const key = event.title.toLowerCase();
-    if (!eventsByTitle.has(key)) {
-      eventsByTitle.set(key, []);
-    }
-    eventsByTitle.get(key).push({ ...event });
-  }
-
+  const seen = new Set();
   const result = [];
 
-  for (const [title, titleEvents] of eventsByTitle) {
-    // Sort events by start date
-    titleEvents.sort((a, b) => a.startDate - b.startDate);
+  for (const event of events) {
+    // Create a unique key for exact duplicates
+    const key = `${event.title.toLowerCase()}|${event.startDate.toISOString()}|${event.endDate.toISOString()}`;
 
-    // Merge overlapping or adjacent events (within 1 day gap)
-    const merged = [];
-    for (const event of titleEvents) {
-      if (merged.length === 0) {
-        merged.push(event);
-        continue;
-      }
-
-      const last = merged[merged.length - 1];
-      const gap = (event.startDate - last.endDate) / (1000 * 60 * 60 * 24); // days
-
-      // Merge if overlapping or adjacent (gap <= 1 day)
-      if (gap <= 1) {
-        // Extend the last event
-        if (event.endDate > last.endDate) {
-          last.endDate = event.endDate;
-        }
-      } else {
-        // Keep as separate event
-        merged.push(event);
-      }
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(event);
     }
-
-    result.push(...merged);
   }
 
   return result;
