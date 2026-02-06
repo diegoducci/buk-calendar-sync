@@ -1,5 +1,11 @@
 import puppeteer from 'puppeteer';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { generateICS } from './generate-ics.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const eventsJsonPath = join(__dirname, '..', 'public', 'events.json');
 
 const BUK_URL = 'https://costasur.buk.cl';
 const BUK_EMAIL = process.env.BUK_EMAIL;
@@ -626,14 +632,35 @@ async function main() {
     await new Promise(r => setTimeout(r, 2000));
 
     // Extract events, passing intercepted data
-    const events = await extractEventsWithInterceptedData(page, interceptedCalendarData);
+    const scrapedEvents = await extractEventsWithInterceptedData(page, interceptedCalendarData);
 
-    if (events.length === 0) {
+    // Read existing events from JSON store
+    let existingEvents = [];
+    if (existsSync(eventsJsonPath)) {
+      existingEvents = JSON.parse(readFileSync(eventsJsonPath, 'utf-8'));
+    }
+
+    // Merge: keep existing + add new (deduplicate by title|date key)
+    function eventKey(event) {
+      const date = new Date(event.startDate).toISOString().split('T')[0];
+      return `${event.title}|${date}`;
+    }
+
+    const seen = new Set(existingEvents.map(eventKey));
+    const newEvents = scrapedEvents.filter(e => !seen.has(eventKey(e)));
+    const allEvents = [...existingEvents, ...newEvents];
+
+    console.log(`Events: ${existingEvents.length} existing, ${newEvents.length} new, ${allEvents.length} total`);
+
+    // Save merged events to JSON
+    writeFileSync(eventsJsonPath, JSON.stringify(allEvents, null, 2));
+
+    if (allEvents.length === 0) {
       console.log('No events found. Creating empty calendar...');
     }
 
-    // Generate ICS file
-    generateICS(events);
+    // Generate ICS file from all events
+    generateICS(allEvents);
 
     console.log('Scraping completed successfully!');
   } catch (error) {
